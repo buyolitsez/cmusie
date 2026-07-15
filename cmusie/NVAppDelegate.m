@@ -1,65 +1,220 @@
 #import "NVAppDelegate.h"
-#import "NVPopoverController.h"
+#import <dlfcn.h>
+#import <MediaPlayer/MediaPlayer.h>
 
 #define MEDIAKEY_DOWN(event) (((([event data1] & 0x0000FFFF) & 0xFF00) >> 8) == 0xA)
 #define MEDIAKEY_CODE(event) (([event data1] & 0xFFFF0000) >> 16)
 
+typedef NS_ENUM(NSUInteger, NVPlaybackTarget) {
+    NVPlaybackTargetCmus,
+    NVPlaybackTargetSystem,
+};
+
+typedef NS_ENUM(NSUInteger, NVSystemCommand) {
+    NVSystemCommandPlay = 0,
+    NVSystemCommandPause = 1,
+    NVSystemCommandTogglePlayPause = 2,
+    NVSystemCommandStop = 3,
+    NVSystemCommandNextTrack = 4,
+    NVSystemCommandPreviousTrack = 5,
+};
+
+typedef void (*MRNowPlayingInfoFunction)(dispatch_queue_t queue, void (^block)(CFDictionaryRef information));
+typedef Boolean (*MRSendCommandFunction)(uint32_t command, CFDictionaryRef userInfo);
+
 @interface NVAppDelegate () {
     CFMachPortRef _mk_tap_port;
+    void *_mediaRemoteHandle;
 }
 
-@property (strong, nonatomic) NSStatusItem *statusItem;
-@property (strong, nonatomic) NSPopover *popover;
-
-- (void)popoverToggle:(NSEvent*)sender;
-
+@property (assign, nonatomic) NVPlaybackTarget lastActiveTarget;
+@property (strong, nonatomic) NSTimer *permissionTimer;
+@property (strong, nonatomic) NSTimer *playbackTimer;
+@property (strong, nonatomic) NSString *mediaRemotePlaybackRateKey;
+@property (assign, nonatomic) BOOL cmusRemoteActive;
+@property (strong, nonatomic) NSDictionary *publishedNowPlayingInfo;
 - (void)mediaKeysTopPriority;
 - (void)mediaKeysRestart;
+- (void)mediaKeysStart;
+- (void)mediaKeysStop;
 - (bool)mediaKeysHandle:(NSEvent*)sender;
+- (void)requestAccessibilityPermissionIfNeeded;
+- (void)startAccessibilityPollingIfNeeded;
+- (void)handleAccessibilityTimer:(NSTimer*)timer;
+- (NSDictionary*)cmusStatus;
+- (BOOL)isSystemPlaybackActive;
+- (NSDictionary*)systemNowPlayingInfo;
+- (NVPlaybackTarget)playbackTargetForKeyCode:(int)keyCode;
+- (BOOL)dispatchCommandForKeyCode:(int)keyCode target:(NVPlaybackTarget)target;
+- (BOOL)dispatchSystemCommandForKeyCode:(int)keyCode;
+- (NSString*)mediaRemoteStringConstantNamed:(const char*)symbolName;
+- (void)remoteCommandsStart;
+- (void)remoteCommandsStop;
+- (void)handlePlaybackTimer:(NSTimer*)timer;
+- (void)updateCmusRemoteState;
+- (MPRemoteCommandHandlerStatus)handleRemoteCommand:(MPRemoteCommandEvent*)event;
 
 @end
 
 @implementation NVAppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
-    NSMenu *menu = [[NSMenu alloc] init];
-    [menu addItemWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@""];
-    
-    NSStatusItem *item = [[NSStatusBar systemStatusBar] statusItemWithLength:NSSquareStatusItemLength];
-    item.button.image = [NSImage imageNamed:@"AppIcon"];
-    item.button.imageScaling = NSImageScaleProportionallyUpOrDown;
-    
-    self.statusItem = item;
-    [self.statusItem.button setAction:@selector(popoverToggle:)];
-    
-    self.popover = [[NSPopover alloc] init];
-    self.popover.animates = NO;
-    self.popover.behavior = NSPopoverBehaviorSemitransient;
-    self.popover.contentViewController = [NVPopoverController create];
-    
-    if (AXIsProcessTrusted())
-        [self mediaKeysStart];
-}
+    self.lastActiveTarget = NVPlaybackTargetCmus;
+    _mediaRemoteHandle = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
+    self.mediaRemotePlaybackRateKey = [self mediaRemoteStringConstantNamed:"kMRMediaRemoteNowPlayingInfoPlaybackRate"];
+    [self remoteCommandsStart];
 
-- (void)applicationWillResignActive:(NSNotification *)notification {
-    if (self.popover.shown) {
-        [self.popover performClose:nil];
+    [self requestAccessibilityPermissionIfNeeded];
+    if (AXIsProcessTrusted()) {
+        [self mediaKeysStart];
+    } else {
+        [self startAccessibilityPollingIfNeeded];
     }
 }
 
-- (BOOL)playerToggle {
-    return [self runCommand:@[@"cmus-remote", @"--pause"]].terminationStatus == 0;
+- (void)applicationWillTerminate:(NSNotification *)aNotification {
+    [self.permissionTimer invalidate];
+    self.permissionTimer = nil;
+    [self.playbackTimer invalidate];
+    self.playbackTimer = nil;
+    [self remoteCommandsStop];
+    [self mediaKeysStop];
+    if (_mediaRemoteHandle) {
+        dlclose(_mediaRemoteHandle);
+        _mediaRemoteHandle = nil;
+    }
 }
 
-- (BOOL)playerPrev {
-    return [self runCommand:@[@"cmus-remote", @"--prev"]].terminationStatus == 0;
+- (void)remoteCommandsStart {
+    MPRemoteCommandCenter *commandCenter = [MPRemoteCommandCenter sharedCommandCenter];
+    [commandCenter.playCommand addTarget:self action:@selector(handleRemoteCommand:)];
+    [commandCenter.pauseCommand addTarget:self action:@selector(handleRemoteCommand:)];
+    [commandCenter.togglePlayPauseCommand addTarget:self action:@selector(handleRemoteCommand:)];
+
+    self.playbackTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                          target:self
+                                                        selector:@selector(handlePlaybackTimer:)
+                                                        userInfo:nil
+                                                         repeats:YES];
+    [self updateCmusRemoteState];
 }
 
-- (BOOL)playerNext {
-    return [self runCommand:@[@"cmus-remote", @"--next"]].terminationStatus == 0;
+- (void)remoteCommandsStop {
+    MPRemoteCommandCenter *commandCenter = [MPRemoteCommandCenter sharedCommandCenter];
+    [commandCenter.playCommand removeTarget:self];
+    [commandCenter.pauseCommand removeTarget:self];
+    [commandCenter.togglePlayPauseCommand removeTarget:self];
+
+    MPNowPlayingInfoCenter *infoCenter = [MPNowPlayingInfoCenter defaultCenter];
+    infoCenter.playbackState = MPNowPlayingPlaybackStateStopped;
+    infoCenter.nowPlayingInfo = nil;
 }
 
-- (NSDictionary*)playerStatus {
+- (void)handlePlaybackTimer:(NSTimer*)timer {
+    [self updateCmusRemoteState];
+}
+
+- (void)updateCmusRemoteState {
+    NSDictionary *status = [self cmusStatus];
+    BOOL running = [status[@"running"] boolValue];
+    BOOL playing = [status[@"playing"] boolValue];
+
+    if (playing) {
+        self.cmusRemoteActive = YES;
+    } else if (!self.cmusRemoteActive) {
+        return;
+    }
+
+    MPNowPlayingInfoCenter *infoCenter = [MPNowPlayingInfoCenter defaultCenter];
+    if (!running) {
+        infoCenter.playbackState = MPNowPlayingPlaybackStateStopped;
+        infoCenter.nowPlayingInfo = nil;
+        self.publishedNowPlayingInfo = nil;
+        self.cmusRemoteActive = NO;
+        return;
+    }
+
+    NSDictionary *tags = status[@"tag"];
+    NSMutableDictionary *nowPlayingInfo = [NSMutableDictionary dictionary];
+    nowPlayingInfo[MPMediaItemPropertyTitle] = tags[@"title"] ?: @"cmus";
+    if (tags[@"artist"]) {
+        nowPlayingInfo[MPMediaItemPropertyArtist] = tags[@"artist"];
+    }
+
+    if (![self.publishedNowPlayingInfo isEqualToDictionary:nowPlayingInfo]) {
+        infoCenter.nowPlayingInfo = nowPlayingInfo;
+        self.publishedNowPlayingInfo = nowPlayingInfo;
+    }
+
+    MPNowPlayingPlaybackState playbackState = playing ? MPNowPlayingPlaybackStatePlaying : MPNowPlayingPlaybackStatePaused;
+    if (infoCenter.playbackState != playbackState) {
+        infoCenter.playbackState = playbackState;
+    }
+}
+
+- (MPRemoteCommandHandlerStatus)handleRemoteCommand:(MPRemoteCommandEvent*)event {
+    NSDictionary *status = [self cmusStatus];
+    if (![status[@"running"] boolValue]) {
+        return MPRemoteCommandHandlerStatusNoSuchContent;
+    }
+
+    BOOL playing = [status[@"playing"] boolValue];
+    MPRemoteCommandCenter *commandCenter = [MPRemoteCommandCenter sharedCommandCenter];
+    NSTask *task = nil;
+
+    if (event.command == commandCenter.playCommand) {
+        if (!playing) {
+            task = [self runCommand:@[@"cmus-remote", @"--play"]];
+        }
+    } else if (event.command == commandCenter.pauseCommand) {
+        if (playing) {
+            task = [self runCommand:@[@"cmus-remote", @"--pause"]];
+        }
+    } else {
+        task = [self runCommand:@[@"cmus-remote", @"--pause"]];
+    }
+
+    if (task && task.terminationStatus != 0) {
+        return MPRemoteCommandHandlerStatusCommandFailed;
+    }
+
+    self.cmusRemoteActive = YES;
+    [self updateCmusRemoteState];
+    return MPRemoteCommandHandlerStatusSuccess;
+}
+
+- (void)requestAccessibilityPermissionIfNeeded {
+    if (AXIsProcessTrusted()) {
+        return;
+    }
+
+    NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
+    AXIsProcessTrustedWithOptions((CFDictionaryRef)options);
+}
+
+- (void)startAccessibilityPollingIfNeeded {
+    if (self.permissionTimer || AXIsProcessTrusted()) {
+        return;
+    }
+
+    self.permissionTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                            target:self
+                                                          selector:@selector(handleAccessibilityTimer:)
+                                                          userInfo:nil
+                                                           repeats:YES];
+}
+
+- (void)handleAccessibilityTimer:(NSTimer*)timer {
+    if (!AXIsProcessTrusted()) {
+        return;
+    }
+
+    [timer invalidate];
+    self.permissionTimer = nil;
+    [self mediaKeysStart];
+}
+
+- (NSDictionary*)cmusStatus {
     NSMutableDictionary *tag = [[NSMutableDictionary alloc] init];
     BOOL running = NO, playing = NO;
     
@@ -89,39 +244,18 @@
     };
 }
 
-- (MediaKeyStatus)mediaKeysStatus {
-    if (!AXIsProcessTrusted())
-        return MediaKeyStatusUnaccessible;
-    return _mk_tap_port ? MediaKeyStatusEnabled : MediaKeyStatusDisabled;
-}
-
-- (void)mediaKeysUnlock {
-    NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
-    BOOL accessibilityEnabled = AXIsProcessTrustedWithOptions((CFDictionaryRef)options);
-    if (accessibilityEnabled) {
-        [self mediaKeysStart];
+- (BOOL)isSystemPlaybackActive {
+    NSDictionary *info = [self systemNowPlayingInfo];
+    if (!info || !self.mediaRemotePlaybackRateKey) {
+        return NO;
     }
-}
 
-- (void)popoverToggle:(NSEvent*)sender {
-    if (self.popover.shown) {
-        [self.popover performClose:sender];
-    } else {
-        [self.popover showRelativeToRect:NSZeroRect
-                                  ofView:self.statusItem.button
-                           preferredEdge:NSRectEdgeMinY];
-        // hack: prevent popover from hiding in full screen mode
-        NSWindow *popoverWindow = self.popover.contentViewController.view.window;
-        [popoverWindow.parentWindow removeChildWindow:popoverWindow];
-    }
+    NSNumber *rate = info[self.mediaRemotePlaybackRateKey];
+    return [rate doubleValue] > 0.0;
 }
 
 - (void)applicationWillBecomeActive:(NSNotification *)notification {
     [self mediaKeysTopPriority];
-}
-
-- (void)applicationWillTerminate:(NSNotification *)aNotification {
-    [[NSStatusBar systemStatusBar] removeStatusItem:self.statusItem];
 }
 
 - (void)mediaKeysTopPriority {
@@ -176,15 +310,109 @@
 }
 
 - (bool)mediaKeysHandle:(NSEvent*)event {
-    switch (MEDIAKEY_CODE(event)) {
+    int keyCode = MEDIAKEY_CODE(event);
+    switch (keyCode) {
         case NX_KEYTYPE_PLAY:
-            return [self playerToggle];
         case NX_KEYTYPE_REWIND:
-            return [self playerPrev];
         case NX_KEYTYPE_FAST:
-            return [self playerNext];
+            return [self dispatchCommandForKeyCode:keyCode target:[self playbackTargetForKeyCode:keyCode]];
     }
     return false;
+}
+
+- (NVPlaybackTarget)playbackTargetForKeyCode:(int)keyCode {
+    NSDictionary *cmusStatus = [self cmusStatus];
+    if ([cmusStatus[@"playing"] boolValue]) {
+        self.lastActiveTarget = NVPlaybackTargetCmus;
+        return NVPlaybackTargetCmus;
+    }
+
+    if ([self isSystemPlaybackActive]) {
+        self.lastActiveTarget = NVPlaybackTargetSystem;
+        return NVPlaybackTargetSystem;
+    }
+
+    return self.lastActiveTarget;
+}
+
+- (BOOL)dispatchCommandForKeyCode:(int)keyCode target:(NVPlaybackTarget)target {
+    switch (target) {
+        case NVPlaybackTargetCmus:
+            self.lastActiveTarget = NVPlaybackTargetCmus;
+            switch (keyCode) {
+                case NX_KEYTYPE_PLAY:
+                    return [self runCommand:@[@"cmus-remote", @"--pause"]].terminationStatus == 0;
+                case NX_KEYTYPE_REWIND:
+                    return [self runCommand:@[@"cmus-remote", @"--prev"]].terminationStatus == 0;
+                case NX_KEYTYPE_FAST:
+                    return [self runCommand:@[@"cmus-remote", @"--next"]].terminationStatus == 0;
+            }
+            return NO;
+        case NVPlaybackTargetSystem:
+            self.lastActiveTarget = NVPlaybackTargetSystem;
+            return [self dispatchSystemCommandForKeyCode:keyCode];
+    }
+}
+
+- (BOOL)dispatchSystemCommandForKeyCode:(int)keyCode {
+    MRSendCommandFunction sendCommand = (MRSendCommandFunction)dlsym(_mediaRemoteHandle, "MRMediaRemoteSendCommand");
+    if (!sendCommand) {
+        return NO;
+    }
+
+    uint32_t command = NVSystemCommandTogglePlayPause;
+    switch (keyCode) {
+        case NX_KEYTYPE_PLAY:
+            command = NVSystemCommandTogglePlayPause;
+            break;
+        case NX_KEYTYPE_REWIND:
+            command = NVSystemCommandPreviousTrack;
+            break;
+        case NX_KEYTYPE_FAST:
+            command = NVSystemCommandNextTrack;
+            break;
+        default:
+            return NO;
+    }
+
+    return sendCommand(command, NULL);
+}
+
+- (NSDictionary*)systemNowPlayingInfo {
+    if (!_mediaRemoteHandle) {
+        return nil;
+    }
+
+    MRNowPlayingInfoFunction getNowPlayingInfo = (MRNowPlayingInfoFunction)dlsym(_mediaRemoteHandle, "MRMediaRemoteGetNowPlayingInfo");
+    if (!getNowPlayingInfo) {
+        return nil;
+    }
+
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    __block NSDictionary *info = nil;
+
+    getNowPlayingInfo(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(CFDictionaryRef information) {
+        if (information) {
+            info = [(__bridge NSDictionary*)information copy];
+        }
+        dispatch_semaphore_signal(semaphore);
+    });
+
+    dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC));
+    return info;
+}
+
+- (NSString*)mediaRemoteStringConstantNamed:(const char*)symbolName {
+    if (!_mediaRemoteHandle) {
+        return nil;
+    }
+
+    void *symbol = dlsym(_mediaRemoteHandle, symbolName);
+    if (!symbol) {
+        return nil;
+    }
+
+    return (__bridge NSString *)(*(void **)symbol);
 }
 
 - (NSTask*)runCommand:(NSArray*)command {
