@@ -1,38 +1,51 @@
-# cmusie
+# macOS Media Key Router
 
-control playback on macos with the media keys only.
+A UI-less macOS utility that routes hardware media keys between `cmus` and the active system media player. It also exposes `cmus` through macOS Now Playing, allowing play/pause buttons on Bluetooth headsets and other media remotes to control it.
 
-![preview](https://raw.githubusercontent.com/nkanaev/cmusie/master/assets/preview.jpg)
+## Behavior
 
-## differences from upstream
+The app supports play/pause, previous-track, and next-track media keys.
 
-Compared with the [original cmusie](https://github.com/nkanaev/cmusie), this fork:
+Routing priority:
 
-- removes the menu-bar popover and runs as a media-key-only background app
-- starts media-key capture automatically after Accessibility permission is granted
-- controls either `cmus` or the active native macOS media player, with a playing `cmus` taking priority
-- registers `cmus` with macOS Now Playing so headset play/pause controls work
+1. If `cmus` is playing, control `cmus`.
+2. Otherwise, if a browser or native macOS media app is playing, control that player.
+3. If nothing is playing, control the last active player.
+4. On first launch, default to `cmus`.
 
-The original tray-based build remains available from the [upstream releases](https://github.com/nkanaev/cmusie/releases/latest).
+The app runs entirely in the background. It has no Dock icon, menu-bar item, or configuration window.
 
-# usage
+## Requirements
 
-1. Open the app.
-2. Grant Accessibility permission when macOS prompts for it.
-3. If you want `cmus` support, make sure `cmus-remote` is on `PATH`:
+- macOS 10.13 or later
+- Accessibility permission for keyboard media-key capture
+- `cmus-remote` on `PATH` when using `cmus`
 
-        ln -s "$(which cmus-remote)" /usr/local/bin/cmus-remote
-4. Media-key routing works like this:
-   - if `cmus` is currently playing, `cmusie` controls `cmus`
-   - otherwise, if a native macOS media player is currently playing, `cmusie` controls that player
-   - if nothing is playing, `cmusie` controls the player that was active last
-   - the default active player is `cmus`
-5. (Optionally) follow the guide [here](https://support.apple.com/en-gb/guide/mac-help/mh15189/mac) to automatically start the app when you log in.
+If a GUI-launched app cannot find `cmus-remote`, make it available in `/usr/local/bin`:
 
-# credits
+```sh
+ln -s "$(command -v cmus-remote)" /usr/local/bin/cmus-remote
+```
 
-* [fontawesome]: for button icons
-* [mpv]: for low-level media keys control code.
+## Build
 
-[fontawesome]: http://fontawesome.com/
-[mpv]: https://github.com/mpv-player/mpv
+```sh
+xcodebuild \
+  -project cmusie.xcodeproj \
+  -scheme cmusie \
+  -configuration Release \
+  -derivedDataPath .deriveddata \
+  build
+```
+
+The built app is located at:
+
+```text
+.deriveddata/Build/Products/Release/cmusie.app
+```
+
+Move it to `/Applications`, open it, and grant Accessibility permission when macOS prompts.
+
+## Attribution
+
+Based on [nkanaev/cmusie](https://github.com/nkanaev/cmusie). The low-level media-key event-tap code is derived from [mpv](https://github.com/mpv-player/mpv).
